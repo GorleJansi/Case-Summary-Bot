@@ -2,7 +2,7 @@
 
 > **Author:** Jansi Gorle · Technical Consulting Engineer · CX
 > **Date:** April 2026 · Proof of Concept
-> **GitHub:** [github.com/GorleJansi/cPaas-sNow-summarisation-agent](https://github.com/GorleJansi/cPaas-sNow-summarisation-agent)
+> **GitHub:** [github.com/GorleJansi/Case-Summary-Bot](https://github.com/GorleJansi/Case-Summary-Bot)
 
 ---
 
@@ -196,7 +196,7 @@ curl -s -H "Authorization: Bearer $WEBEX_BOT_TOKEN" https://webexapis.com/v1/web
 
 | Item | Value |
 |------|-------|
-| **URL** | [github.com/GorleJansi/cPaas-sNow-summarisation-agent](https://github.com/GorleJansi/cPaas-sNow-summarisation-agent) |
+| **URL** | [github.com/GorleJansi/Case-Summary-Bot](https://github.com/GorleJansi/Case-Summary-Bot) |
 | **Branch** | `main` |
 
 ---
