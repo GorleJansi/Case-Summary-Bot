@@ -546,4 +546,252 @@ The `summary_agent` IAM user (for CLI deploys) needs:
 
 ---
 
+## 14. Beginner-Friendly Code Walkthrough
+
+> This section explains the entire codebase as if you have zero prior knowledge of the project. It covers what each file does, how the code flows, and why certain design decisions were made.
+
+### What Is This Project?
+
+This is a chatbot that lives inside Webex (Cisco's chat app). Engineers DM this bot with a ServiceNow case number (like CS0001028), and the bot replies with an AI-generated summary of that case — so they don't have to spend 15 minutes reading through dozens of comments and emails.
+
+### The Players (What Talks to What)
+
+```
+┌──────────┐      ┌──────────────┐      ┌────────────┐      ┌─────────────┐
+│  Engineer │ ──→  │    Webex      │ ──→  │ AWS Lambda  │ ──→  │ ServiceNow  │
+│  (you)    │      │  (chat app)  │      │ (our code)  │      │ (tickets)   │
+└──────────┘      └──────────────┘      └────────────┘      └─────────────┘
+                                              │
+                                              └──→  ┌──────────────┐
+                                                     │ CIRCUIT LLM  │
+                                                     │ (Cisco's AI) │
+                                                     └──────────────┘
+```
+
+- **Webex** = where the engineer types messages
+- **AWS Lambda** = a cloud computer that runs our Python code (no server to manage)
+- **ServiceNow** = where support tickets live (case details, comments, emails)
+- **CIRCUIT LLM** = Cisco's internal AI (like ChatGPT, but inside Cisco)
+
+---
+
+### File-by-File Explanation
+
+#### File 1: `config.py` (32 lines) — The Password Vault
+
+Think of this as a keychain. It loads all the secret passwords and URLs the bot needs:
+
+| Variable | What It Is |
+|----------|-----------|
+| `SERVICENOW_INSTANCE` | The URL of the ticketing system (like `dev380388.service-now.com`) |
+| `SERVICENOW_USERNAME/PASSWORD` | Login credentials for the ticketing system |
+| `WEBEX_BOT_TOKEN` | The bot's "access pass" to read/send Webex messages |
+| `CIRCUIT_CLIENT_ID/SECRET` | Login credentials for Cisco's AI (CIRCUIT) |
+| `CIRCUIT_APP_KEY` | Permission key to use the AI |
+
+These are stored as environment variables on AWS Lambda, not in the code. So the code never contains actual passwords.
+
+---
+
+#### File 2: `lambda_handler.py` (43 lines) — The Front Door
+
+This is the first thing that runs when anything happens. Think of it as a receptionist:
+
+```
+Someone knocks on the door →
+  "Is this a normal Webex message?"  →  Send to FastAPI (the main app)
+  "Is this an async summary job?"    →  Run the heavy pipeline directly
+```
+
+**Why two paths?** Because the Webex webhook has a 30-second timeout. If the bot takes 15 seconds to summarize, the webhook would fail. So the bot uses a clever trick:
+
+- **Path 1 (fast):** Receive the message, send a "loading..." card, then tell Lambda to run itself again in the background. Returns in 1-2 seconds.
+- **Path 2 (slow):** The second Lambda execution takes its time fetching data and calling AI. No timeout pressure.
+
+---
+
+#### File 3: `servicenow_client.py` (80 lines) — The Ticket Reader
+
+This file talks to ServiceNow (the ticketing system where support cases live). It has 3 functions:
+
+| Function | What It Does | Think of it as... |
+|----------|-------------|-------------------|
+| `get_case_by_number("CS0001028")` | Gets the ticket's basic info (title, priority, who's assigned) | Reading the ticket header |
+| `get_case_journal_entries(sys_id)` | Gets all comments and work notes on the ticket | Reading the conversation thread |
+| `get_case_emails(sys_id)` | Gets all emails attached to the ticket | Reading the email chain |
+
+Each function makes an HTTP GET request to ServiceNow's REST API, like visiting a URL:
+```
+https://dev380388.service-now.com/api/now/table/sn_customerservice_case?number=CS0001028
+```
+
+---
+
+#### File 4: `formatter.py` (79 lines) — The Organizer
+
+This takes the raw data from ServiceNow (comments, work notes, emails — all jumbled) and:
+
+1. **Labels each entry** — "Is this from the customer or the engineer?"
+2. **Sorts everything by time** — oldest first
+3. **Outputs a clean timeline** like:
+
+```
+1. [2025-01-15T10:00:00Z] customer: "My login page shows a 404 error"
+2. [2025-01-15T11:30:00Z] support_engineer: "Checked CDN logs, found stale cache"
+3. [2025-01-15T14:00:00Z] customer: "It's working now, thank you!"
+```
+
+This timeline is what the AI will read.
+
+---
+
+#### File 5: `summarizer.py` (222 lines) — The AI Brain
+
+This file does three things:
+
+**Step 1: Get permission to talk to the AI** (`get_access_token`)
+- Sends our client ID + secret to Cisco's identity server (id.cisco.com)
+- Gets back a temporary access token (like a visitor badge)
+
+**Step 2: Build the prompt** (`build_prompt`)
+- Takes the case data + timeline and formats a very specific instruction for the AI
+- "Here's a support ticket. Summarize it in this EXACT format: Problem, Root Cause, What Was Done, Current Status, Next Steps"
+- "Don't make stuff up. Don't include names/emails. Keep it under 200 words."
+
+**Step 3: Call the AI** (`call_circuit_llm`)
+- Sends the prompt to `chat-ai.cisco.com` (Cisco's internal AI, like ChatGPT but for Cisco)
+- The AI reads the timeline and writes a structured summary
+- Returns plain text like:
+
+```
+Problem:
+Users see a 404 on the login page.
+
+What Was Done:
+- Analyzed HAR data from affected users
+- Forced CDN cache purge
+
+Current Status:
+Issue resolved. Monitoring for 24h.
+```
+
+---
+
+#### File 6: `app.py` (940 lines) — The Brain / Main File
+
+This is the biggest and most important file. It handles everything the user sees.
+
+**Low-Level Utilities (lines 1-140)**
+- `_headers()` — adds the bot's auth token to every Webex API call
+- `_request()` — makes HTTP calls with retry logic (try 3 times before giving up)
+- `is_bot_message()` — checks if a message came from a bot (to avoid infinite loops)
+
+**Webex API Functions (lines 140-230)**
+
+| Function | What It Does |
+|----------|-------------|
+| `get_webex_message(id)` | Reads a message from Webex |
+| `send_text(room_id, text)` | Sends a plain text reply |
+| `send_card(room_id, card)` | Sends a rich card (like an app screen) |
+| `replace_card(message_id, card)` | Swaps an existing card for a new one (in-place!) |
+
+**Adaptive Card Templates (lines 230-470)** — The 4 "screens" the user sees:
+
+```
+┌─────────────┐    ┌─────────────┐    ┌─────────────┐    ┌─────────────┐
+│ 1. WELCOME  │ →  │  2. INPUT   │ →  │ 3. WORKING  │ →  │ 4. SUMMARY  │
+│             │    │             │    │             │    │             │
+│ "Hi! I'm    │    │ [________]  │    │ ⏳ Fetching  │    │ Problem:    │
+│  the Case   │    │ CS0001028   │    │ case data…  │    │ Users see…  │
+│  Summary    │    │             │    │             │    │             │
+│  Bot"       │    │ [Summarize] │    │ Please wait │    │ [Another]   │
+│             │    │ [Cancel]    │    │             │    │ [Close]     │
+│ [Get Start] │    │             │    │             │    │             │
+└─────────────┘    └─────────────┘    └─────────────┘    └─────────────┘
+```
+
+Each card replaces the previous one — no card spam in the chat.
+
+**The Pipeline (lines 470-570)** — `get_summary()` chains everything:
+
+```
+get_case_by_number()          → "What is this ticket?"
+get_case_journal_entries()    → "What did people write?"
+get_case_emails()             → "What emails were sent?"
+build_timeline()              → "Put it all in order"
+summarize_case_with_llm()    → "AI, summarize this!"
+```
+
+`_summarize_and_flip()` takes the summary and replaces the loading card with the result.
+
+**Guards & Filters (lines 570-620)** — The bot must ignore:
+- Its own messages (or it loops forever!)
+- Echoed card text that Webex sends back
+- Thread replies
+
+**Message Routing (lines 620-720)** — `_route_message()` decides what to do:
+
+| User Types | Bot Does |
+|-----------|---------|
+| `CS0001028` | Shows loading card → runs summary |
+| `summarize CS0001028` | Same thing |
+| `exit` / `quit` / `close` | Says goodbye |
+| Anything else | Shows the input form |
+
+**Webhook Endpoints (lines 720-940)** — Two URLs that Webex calls:
+
+| URL | Triggers When |
+|-----|--------------|
+| `POST /webhook/webex` | Someone sends a text message |
+| `POST /webhook/webex/card-action` | Someone clicks a button on a card |
+
+Each endpoint has 5 guard checks before doing anything:
+1. Do we have a message ID? (skip if missing)
+2. Is this a thread reply? (skip)
+3. Is this from a bot? (skip)
+4. Can we actually read the message? (skip if not in room)
+5. Is this just an echo of our own card? (skip)
+
+Only after all 5 pass does it route the message.
+
+---
+
+### The Complete Journey (End to End)
+
+```
+1.  👤 Engineer opens Webex, DMs "Case Summary Bot"
+
+2.  💬 Webex sees a new message → fires HTTP POST to our webhook URL
+    (https://fe4puvvg5j.execute-api.us-east-1.amazonaws.com/webhook/webex)
+
+3.  🌐 AWS API Gateway receives the POST → triggers Lambda
+
+4.  ⚡ lambda_handler.handler() runs → sees it's an HTTP event → sends to FastAPI
+
+5.  🔍 webex_webhook() runs 5 guard checks → fetches full message → passes to _route_message()
+
+6.  🧭 _route_message() sees "CS0001028" → sends ⏳ working card → calls _invoke_summary_async()
+
+7.  🚀 _invoke_summary_async() uses boto3 to invoke THIS SAME Lambda again, but asynchronously
+    (returns HTTP 200 to Webex immediately — total time: ~1-2 seconds)
+
+8.  ⚡ NEW Lambda execution starts → handler() sees _async_summary=true → calls _summarize_and_flip()
+
+9.  📊 _summarize_and_flip() runs the full pipeline:
+    a. ServiceNow → get case details       (1-2 sec)
+    b. ServiceNow → get comments/notes     (1-2 sec)
+    c. ServiceNow → get emails             (1-2 sec)
+    d. formatter  → build sorted timeline  (instant)
+    e. CIRCUIT    → get OAuth token         (1 sec)
+    f. CIRCUIT    → call AI for summary     (2-4 sec)
+
+10. 📋 replace_card() swaps the ⏳ loading card with the ✅ summary card
+
+11. 👤 Engineer sees the summary appear — total wait: 5-8 seconds
+```
+
+That's the entire codebase. Six files, one flow, all serverless. No servers to manage — Lambda runs only when someone messages the bot.
+
+---
+
 *Last updated: 14 April 2026*
